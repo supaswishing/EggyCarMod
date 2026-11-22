@@ -1,11 +1,3 @@
-/*
- * Eggy Car mod menu
- * Loaded after c2runtime.js. Talks to the running Construct 2 runtime through
- *  - global variables (rt.all_global_vars), e.g. myCoins, myScore, MAGNET_TIME, FREEZE_TIME
- *  - the Function plugin, to run the game's own functions by name (Update_Coins, Spawn_aEgg, ...)
- *  - a wrapper around rt.trigger, to stop specific game functions from firing (invincible egg,
- *    infinite power-ups)
- */
 (function () {
   "use strict";
   if (window.EggyMods) return;
@@ -13,12 +5,16 @@
   var INF_TIME = 1000000;
   var rt = null;
   var ready = false;
-  var FN_MATCH = null;   // Function plugin OnFunction condition
-  var FN_CALL = null;    // Function plugin CallFunction action
-  var originals = {};    // original power-up durations, read once at startup
+  var FN_MATCH = null;
+  var FN_CALL = null;
+  var caller = null;
+  var originals = {};
+  var lastSeq = null;
+  var enterTimer = null;
+  var extraEggs = 0;
+  var speedFactor = 1;
   var state = { invincible: false, infMagnet: false, infFreeze: false };
 
-  // ---------- runtime helpers ----------
 
   function findGlobal(name) {
     var list = rt && rt.all_global_vars;
@@ -41,31 +37,38 @@
     return true;
   }
 
-  function callGameFunction(name) {
+  function callGameFunction(name, params) {
     if (!ready) return false;
-    FN_CALL.call({ runtime: rt }, name, []);
-    return true;
+    try {
+      FN_CALL.call(caller, name, params || []);
+      return true;
+    } catch (err) {
+      console.error("[mod menu] " + name + " failed:", err);
+      return false;
+    }
   }
 
-  // Hook trigger so specific game functions can be swallowed while a mod is on.
   function installTriggerHook() {
     var original = rt.trigger;
     rt.trigger = function (method, inst, value) {
       if (method === FN_MATCH && typeof value === "string") {
         var name = value.toLowerCase();
-        // "Collided with track" is what makes the egg break; skipping it = invincible egg
-        if (state.invincible && name === "collided with track") return false;
-        // Stop the power bar from finishing while an infinite power-up is on
+        if (name === "end_game") extraEggs = 0;
+        if (state.invincible && (name === "collided with track" || name === "end_game")) return false;
         if ((state.infMagnet || state.infFreeze) && name === "on_powerbar_finished") return false;
       }
       return original.apply(this, arguments);
     };
   }
 
-  function applyPowerUps() {
-    if (!ready) return;
-    setVar("MAGNET_TIME", state.infMagnet ? INF_TIME : originals.MAGNET_TIME);
-    setVar("FREEZE_TIME", state.infFreeze ? INF_TIME : originals.FREEZE_TIME);
+  function startPowerUp(type) {
+    setVar(type === "MAGNET" ? "MAGNET_TIME" : "FREEZE_TIME", INF_TIME);
+    callGameFunction("Activate_aPowerBar", [type, INF_TIME]);
+  }
+
+  function stopPowerUp(type) {
+    setVar(type === "MAGNET" ? "MAGNET_TIME" : "FREEZE_TIME", originals[type]);
+    callGameFunction("On_PowerBar_Finished", [type]);
   }
 
   function setCoins(n) {
@@ -82,6 +85,13 @@
     return true;
   }
 
+  function setSpeed(factor) {
+    speedFactor = factor;
+    if (ready && originals.MAX_VIR_SPEED !== undefined) {
+      setVar("MAX_VIR_SPEED", originals.MAX_VIR_SPEED * factor);
+    }
+  }
+
   function tryInit() {
     var r = window.cr_getC2Runtime && window.cr_getC2Runtime();
     if (!r || !r.all_global_vars || !r.running_layout) return false;
@@ -91,41 +101,45 @@
 
     FN_MATCH = cr.plugins_.Function.prototype.cnds.OnFunction;
     FN_CALL = cr.plugins_.Function.prototype.acts.CallFunction;
-    originals.MAGNET_TIME = getVar("MAGNET_TIME");
-    originals.FREEZE_TIME = getVar("FREEZE_TIME");
+    caller = { runtime: rt, type: { name: "system", families: [] } };
+
+    originals.MAGNET = getVar("MAGNET_TIME");
+    originals.FREEZE = getVar("FREEZE_TIME");
+    originals.MAX_VIR_SPEED = getVar("MAX_VIR_SPEED");
+    lastSeq = getVar("gameSequence");
     installTriggerHook();
     ready = true;
     return true;
   }
 
-  // ---------- UI ----------
 
   var CSS = [
     "#em-panel{position:fixed;top:12px;right:12px;width:230px;z-index:99999;",
     "font:13px/1.35 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#fff;",
-    "background:rgba(20,28,40,.72);backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);",
-    "border:1px solid rgba(255,255,255,.22);border-radius:14px;box-shadow:0 8px 28px rgba(0,0,0,.35);",
-    "user-select:none;-webkit-user-select:none;touch-action:auto}",
-    "#em-panel .em-head{display:flex;align-items:center;justify-content:space-between;padding:9px 10px 9px 12px;",
-    "cursor:move;border-bottom:1px solid rgba(255,255,255,.15);font-weight:700;letter-spacing:.2px}",
-    "#em-panel .em-min{width:24px;height:24px;border:0;border-radius:7px;background:rgba(255,255,255,.18);",
+    "background:#1c2430;border:1px solid #3a4658;border-radius:10px;",
+    "user-select:none;-webkit-user-select:none;text-transform:lowercase}",
+    "#em-panel *{text-transform:lowercase;box-shadow:none;text-shadow:none}",
+    "#em-panel .em-head{display:flex;align-items:center;justify-content:space-between;padding:8px 8px 8px 12px;",
+    "cursor:move;border-bottom:1px solid #3a4658;font-weight:700}",
+    "#em-panel .em-min{width:24px;height:24px;border:0;border-radius:6px;background:#2d3848;",
     "color:#fff;font-size:16px;line-height:22px;cursor:pointer;padding:0}",
-    "#em-panel .em-body{padding:10px 12px 12px;max-height:70vh;overflow:auto}",
+    "#em-panel .em-body{padding:8px 12px 12px;max-height:75vh;overflow:auto}",
     "#em-panel.em-collapsed .em-body{display:none}",
-    "#em-panel .em-status{font-size:11px;opacity:.7;margin-bottom:8px}",
-    "#em-panel .em-sec{font-size:11px;text-transform:uppercase;letter-spacing:.8px;opacity:.6;margin:10px 0 6px}",
-    "#em-panel label{display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer}",
-    "#em-panel input[type=checkbox]{width:16px;height:16px;accent-color:#7fd6ff;margin:0}",
-    "#em-panel .em-row{display:flex;gap:6px;margin-bottom:6px}",
-    "#em-panel input[type=number]{flex:1;min-width:0;padding:6px 8px;border-radius:8px;border:1px solid rgba(255,255,255,.25);",
-    "background:rgba(0,0,0,.25);color:#fff;font:inherit;outline:none}",
-    "#em-panel button.em-btn{padding:6px 10px;border:0;border-radius:8px;background:rgba(127,214,255,.25);",
-    "color:#fff;font:inherit;font-weight:600;cursor:pointer;white-space:nowrap}",
-    "#em-panel button.em-btn:hover{background:rgba(127,214,255,.4)}",
-    "#em-panel button.em-btn:disabled,#em-panel input:disabled{opacity:.4;cursor:not-allowed}"
+    "#em-panel .em-status{font-size:11px;opacity:.7;margin-bottom:6px}",
+    "#em-panel .em-sec{font-size:11px;opacity:.6;margin:10px 0 4px}",
+    "#em-panel label{display:flex;align-items:center;gap:8px;padding:3px 0;cursor:pointer}",
+    "#em-panel input[type=checkbox]{width:15px;height:15px;accent-color:#5a9fd4;margin:0}",
+    "#em-panel .em-row{display:flex;gap:6px;margin-bottom:6px;align-items:center}",
+    "#em-panel input[type=number]{flex:1;min-width:0;padding:5px 7px;border-radius:6px;border:1px solid #3a4658;",
+    "background:#131a24;color:#fff;font:inherit;outline:none}",
+    "#em-panel input[type=range]{flex:1;accent-color:#5a9fd4}",
+    "#em-panel .em-val{width:44px;text-align:right;font-size:12px}",
+    "#em-panel button.em-btn{padding:5px 9px;border:0;border-radius:6px;background:#2d3848;",
+    "color:#fff;font:inherit;cursor:pointer;white-space:nowrap}",
+    "#em-panel button.em-btn:hover{background:#384559}"
   ].join("");
 
-  var panel, body, statusEl, minBtn;
+  var panel, statusEl, minBtn, flashTimer = null;
 
   function el(tag, attrs, text) {
     var n = document.createElement(tag);
@@ -134,12 +148,27 @@
     return n;
   }
 
-  function addToggle(parent, key, label) {
+  function flash(msg) {
+    statusEl.textContent = msg;
+    clearTimeout(flashTimer);
+    flashTimer = setTimeout(refreshStatus, 1800);
+  }
+
+  function refreshStatus() {
+    statusEl.textContent = ready ? "connected to game" : "waiting for game to load...";
+  }
+
+  function addToggle(parent, key, label, onChange) {
     var lab = el("label");
     var cb = el("input", { type: "checkbox" });
     cb.addEventListener("change", function () {
+      if (!ready) {
+        cb.checked = false;
+        flash("game not ready yet");
+        return;
+      }
       state[key] = cb.checked;
-      applyPowerUps();
+      onChange(cb.checked);
     });
     lab.appendChild(cb);
     lab.appendChild(document.createTextNode(label));
@@ -154,93 +183,36 @@
     return b;
   }
 
-  function addNumberSetter(parent, placeholder, label, onApply) {
+  function addNumberSetter(parent, name, onApply) {
     var row = el("div", { "class": "em-row" });
-    var input = el("input", { type: "number", min: "0", step: "1", placeholder: placeholder });
+    var input = el("input", { type: "number", min: "0", step: "1", placeholder: name });
     row.appendChild(input);
-    addButton(row, label, function () {
+    addButton(row, "set " + name, function () {
       var n = Math.floor(Number(input.value));
-      if (!isFinite(n) || n < 0) { flash("Enter a whole number"); return; }
-      if (!onApply(n)) flash("Game not ready yet");
-      else flash(placeholder.charAt(0).toUpperCase() + placeholder.slice(1) + " set to " + n);
+      if (input.value === "" || !isFinite(n) || n < 0) { flash("enter a whole number"); return; }
+      if (!ready) { flash("game not ready yet"); return; }
+      if (onApply(n)) flash(name + " set to " + n);
+      else flash("failed, see console");
     });
+    parent.appendChild(row);
+  }
+
+  function addSpeedSlider(parent) {
+    var row = el("div", { "class": "em-row" });
+    var input = el("input", { type: "range", min: "50", max: "200", step: "5", value: "100" });
+    var val = el("span", { "class": "em-val" }, "100%");
+    input.addEventListener("input", function () {
+      var pct = Number(input.value);
+      val.textContent = pct + "%";
+      if (!ready) { flash("game not ready yet"); return; }
+      setSpeed(pct / 100);
+    });
+    row.appendChild(input);
+    row.appendChild(val);
     parent.appendChild(row);
     return input;
   }
 
-  var flashTimer = null;
-  function flash(msg) {
-    statusEl.textContent = msg;
-    clearTimeout(flashTimer);
-    flashTimer = setTimeout(refreshStatus, 1600);
-  }
-
-  function refreshStatus() {
-    statusEl.textContent = ready ? "Connected to game" : "Waiting for game to load...";
-  }
-
-  function buildPanel() {
-    var style = el("style");
-    style.textContent = CSS;
-    document.head.appendChild(style);
-
-    panel = el("div", { id: "em-panel" });
-    stopInputLeak(panel);
-
-    var head = el("div", { "class": "em-head" });
-    head.appendChild(el("span", null, "Eggy Mods"));
-    minBtn = el("button", { type: "button", "class": "em-min", title: "Minimize" }, "–");
-    head.appendChild(minBtn);
-    panel.appendChild(head);
-
-    body = el("div", { "class": "em-body" });
-    statusEl = el("div", { "class": "em-status" });
-    body.appendChild(statusEl);
-
-    body.appendChild(el("div", { "class": "em-sec" }, "Cheats"));
-    var invCb = addToggle(body, "invincible", "Invincible egg");
-    var magCb = addToggle(body, "infMagnet", "Infinite magnet");
-    var frzCb = addToggle(body, "infFreeze", "Infinite freeze egg");
-
-    body.appendChild(el("div", { "class": "em-sec" }, "Eggs"));
-    addButton(body, "Spawn extra egg", function () {
-      if (!callGameFunction("Spawn_aEgg")) flash("Game not ready yet");
-      else flash("Extra egg spawned");
-    });
-
-    body.appendChild(el("div", { "class": "em-sec" }, "Set values"));
-    addNumberSetter(body, "coins", "Set coins", setCoins);
-    addNumberSetter(body, "score", "Set score", setScore);
-
-    panel.appendChild(body);
-    document.body.appendChild(panel);
-
-    // Minimize / maximize
-    minBtn.addEventListener("click", function () {
-      var collapsed = panel.classList.toggle("em-collapsed");
-      minBtn.textContent = collapsed ? "+" : "–";
-      minBtn.title = collapsed ? "Maximize" : "Minimize";
-    });
-
-    // Drag by header
-    makeDraggable(panel, head);
-
-    // Keep the 'ready' state visible and keep toggles in sync
-    refreshStatus();
-    setInterval(function () {
-      if (!ready && tryInit()) {
-        applyPowerUps();
-      }
-      refreshStatus();
-    }, 500);
-
-    // Re-apply power-up durations periodically so they stay set
-    setInterval(applyPowerUps, 500);
-
-    return { invCb: invCb, magCb: magCb, frzCb: frzCb };
-  }
-
-  // Keep typing and clicks in the menu from reaching the game's input handlers
   function stopInputLeak(node) {
     ["keydown", "keyup", "keypress", "pointerdown", "mousedown", "touchstart", "wheel"].forEach(function (type) {
       node.addEventListener(type, function (e) { e.stopPropagation(); }, false);
@@ -258,43 +230,112 @@
       node.style.right = "auto";
       node.style.left = r.left + "px";
       node.style.top = r.top + "px";
-      handle.setPointerCapture && handle.setPointerCapture(e.pointerId);
+      if (handle.setPointerCapture) handle.setPointerCapture(e.pointerId);
       e.preventDefault();
     });
     handle.addEventListener("pointermove", function (e) {
       if (!dragging) return;
-      var x = Math.min(Math.max(0, e.clientX - dx), window.innerWidth - 60);
-      var y = Math.min(Math.max(0, e.clientY - dy), window.innerHeight - 40);
-      node.style.left = x + "px";
-      node.style.top = y + "px";
+      node.style.left = Math.min(Math.max(0, e.clientX - dx), window.innerWidth - 60) + "px";
+      node.style.top = Math.min(Math.max(0, e.clientY - dy), window.innerHeight - 40) + "px";
     });
     var stop = function () { dragging = false; };
     handle.addEventListener("pointerup", stop);
     handle.addEventListener("pointercancel", stop);
   }
 
-  // ---------- start ----------
+  function buildPanel() {
+    var style = el("style");
+    style.textContent = CSS;
+    document.head.appendChild(style);
 
-  function start() {
-    var ui = buildPanel();
-    // Sync checkboxes with state (in case something toggled them)
+    panel = el("div", { id: "em-panel" });
+    stopInputLeak(panel);
+
+    var head = el("div", { "class": "em-head" });
+    head.appendChild(el("span", null, "mod menu"));
+    minBtn = el("button", { type: "button", "class": "em-min", title: "minimize" }, "–");
+    head.appendChild(minBtn);
+    panel.appendChild(head);
+
+    var body = el("div", { "class": "em-body" });
+    statusEl = el("div", { "class": "em-status" });
+    body.appendChild(statusEl);
+
+    body.appendChild(el("div", { "class": "em-sec" }, "cheats"));
+    var invCb = addToggle(body, "invincible", "invincible egg", function () {});
+    var magCb = addToggle(body, "infMagnet", "infinite magnet", function (on) {
+      if (on) startPowerUp("MAGNET"); else stopPowerUp("MAGNET");
+    });
+    var frzCb = addToggle(body, "infFreeze", "infinite freeze egg", function (on) {
+      if (on) startPowerUp("FREEZE"); else stopPowerUp("FREEZE");
+    });
+
+    body.appendChild(el("div", { "class": "em-sec" }, "eggs"));
+    addButton(body, "spawn extra egg", function () {
+      if (!ready) { flash("game not ready yet"); return; }
+      if (callGameFunction("Spawn_aEgg")) { extraEggs++; flash("extra eggs this run: " + extraEggs); }
+      else flash("failed, see console");
+    });
+
+    body.appendChild(el("div", { "class": "em-sec" }, "car speed"));
+    addSpeedSlider(body);
+
+    body.appendChild(el("div", { "class": "em-sec" }, "set values"));
+    addNumberSetter(body, "coins", setCoins);
+    addNumberSetter(body, "score", setScore);
+
+    panel.appendChild(body);
+    document.body.appendChild(panel);
+
+    minBtn.addEventListener("click", function () {
+      var collapsed = panel.classList.toggle("em-collapsed");
+      minBtn.textContent = collapsed ? "+" : "–";
+      minBtn.title = collapsed ? "maximize" : "minimize";
+    });
+
+    makeDraggable(panel, head);
+    refreshStatus();
+
     setInterval(function () {
-      ui.invCb.checked = state.invincible;
-      ui.magCb.checked = state.infMagnet;
-      ui.frzCb.checked = state.infFreeze;
+      if (!ready && tryInit()) {
+        if (state.infMagnet) startPowerUp("MAGNET");
+        if (state.infFreeze) startPowerUp("FREEZE");
+        if (speedFactor !== 1) setSpeed(speedFactor);
+      }
+      refreshStatus();
+      invCb.checked = state.invincible;
+      magCb.checked = state.infMagnet;
+      frzCb.checked = state.infFreeze;
+      if (ready) checkNewRun();
     }, 500);
   }
+
+  function checkNewRun() {
+    var seq = getVar("gameSequence");
+    var gp = getVar("SEQ_GP");
+    if (seq === gp && lastSeq !== gp) {
+      extraEggs = 0;
+      clearTimeout(enterTimer);
+      enterTimer = setTimeout(function () {
+        if (state.infFreeze) startPowerUp("FREEZE");
+        else if (state.infMagnet) startPowerUp("MAGNET");
+      }, 600);
+    }
+    lastSeq = seq;
+  }
+
 
   window.EggyMods = {
     state: state,
     setCoins: setCoins,
     setScore: setScore,
+    setSpeed: setSpeed,
     spawnEgg: function () { return callGameFunction("Spawn_aEgg"); }
   };
 
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", start);
+    document.addEventListener("DOMContentLoaded", buildPanel);
   } else {
-    start();
+    buildPanel();
   }
 })();
