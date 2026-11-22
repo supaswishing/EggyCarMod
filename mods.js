@@ -1,3 +1,12 @@
+/*
+ * mod menu for eggy car
+ * loaded after c2runtime.js. uses:
+ *  - global variables: myCoins, myScore, myBestDistance, SCORE_PER_PIXEL, MAGNET_TIME, FREEZE_TIME,
+ *    MAX_VIR_SPEED, COM_BALANCE_FORCE, gameSequence, SEQ_GP
+ *  - the function plugin, to run the game's own functions by name
+ *  - a wrapper around rt.trigger, to stop specific game functions from firing
+ *  - text objects on the hud layer: the live meter and the top-right best
+ */
 (function () {
   "use strict";
   if (window.EggyMods) return;
@@ -13,14 +22,16 @@
   var enterTimer = null;
   var speedFactor = 1;
 
-  var liveOffset = 0;
-  var pendingLive = null;
+  // score state
+  var liveOffset = 0;        // added to whatever the game shows for the live meter
+  var pendingLive = null;    // a set score waiting for the meter to appear
   var lastLiveWritten = null;
-  var bestValue = null;
+  var bestValue = null;      // highest meters the menu will show at the top right
   var lastBestWritten = null;
 
   var state = { invincible: false, infMagnet: false, infFreeze: false };
 
+  // ---------- runtime helpers ----------
 
   function findGlobal(name) {
     var list = rt && rt.all_global_vars;
@@ -69,6 +80,7 @@
     return out;
   }
 
+  // Swallow game functions while a mod is on.
   function installTriggerHook() {
     var original = rt.trigger;
     rt.trigger = function (method, inst, value) {
@@ -109,6 +121,7 @@
     return true;
   }
 
+  // Score is a running offset on the live meter, so later distance adds on top of it.
   function setScore(n) {
     if (!ready) return false;
     setVar("myScore", n);
@@ -142,9 +155,11 @@
     if (originals.COM_BALANCE_FORCE !== undefined) setVar("COM_BALANCE_FORCE", originals.COM_BALANCE_FORCE * speedFactor);
   }
 
+  // ---------- meters ----------
 
   var METER = /^\s*-?\d+(\.\d+)?\s*m\s*$/;
 
+  // The top-right meter is the best; the other meter is the live one.
   function findMeters() {
     var list = hudTexts().filter(function (inst) { return METER.test(inst.text); });
     if (list.length === 0) return { live: null, best: null };
@@ -193,6 +208,7 @@
     }
   }
 
+  // ---------- setup ----------
 
   function tryInit() {
     var r = window.cr_getC2Runtime && window.cr_getC2Runtime();
@@ -215,6 +231,7 @@
     return true;
   }
 
+  // ---------- ui ----------
 
   var CSS = [
     "#em-panel{position:fixed;top:12px;right:12px;width:230px;z-index:99999;",
@@ -373,6 +390,7 @@
 
     makeDraggable(panel, head);
 
+    // score and speed have to hold every frame, so they run in the render loop
     (function frame() {
       updateMeters();
       applySpeed();
@@ -404,6 +422,7 @@
     lastSeq = seq;
   }
 
+  // ---------- start ----------
 
   window.EggyMods = {
     state: state,
