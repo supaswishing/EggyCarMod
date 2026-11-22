@@ -1,12 +1,3 @@
-/*
- * mod menu for eggy car
- * loaded after c2runtime.js. uses:
- *  - global variables: myCoins, myScore, acuDistance, SCORE_PER_PIXEL, MAGNET_TIME, FREEZE_TIME,
- *    MAX_VIR_SPEED, COM_BALANCE_FORCE, gameSequence, SEQ_GP
- *  - the function plugin, to run the game's own functions by name
- *  - a wrapper around rt.trigger, to stop specific game functions from firing
- *  - the hud layer's text objects, so displayed numbers update right away
- */
 (function () {
   "use strict";
   if (window.EggyMods) return;
@@ -14,18 +5,22 @@
   var INF_TIME = 1000000;
   var rt = null;
   var ready = false;
-  var FN_MATCH = null;   // function plugin OnFunction condition
-  var FN_CALL = null;    // function plugin CallFunction action
-  var caller = null;     // fake "this" for FN_CALL: needs runtime and a system type
+  var FN_MATCH = null;
+  var FN_CALL = null;
+  var caller = null;
   var originals = {};
   var lastSeq = null;
   var enterTimer = null;
-  var allowEnd = false;  // lets the end run button through while invincible is on
-  var extraEggs = 0;
   var speedFactor = 1;
+
+  var liveOffset = 0;
+  var pendingLive = null;
+  var lastLiveWritten = null;
+  var bestValue = null;
+  var lastBestWritten = null;
+
   var state = { invincible: false, infMagnet: false, infFreeze: false };
 
-  // ---------- runtime helpers ----------
 
   function findGlobal(name) {
     var list = rt && rt.all_global_vars;
@@ -48,7 +43,6 @@
     return true;
   }
 
-  // Runs a game function by name. Errors go to the console only.
   function callGameFunction(name, params) {
     if (!ready) return false;
     try {
@@ -60,32 +54,32 @@
     }
   }
 
-  // Finds text objects on the hud layer and runs fn on each one.
-  function forEachHudText(fn) {
+  function hudTexts() {
+    var out = [];
     var layout = rt && rt.running_layout;
-    if (!layout || !layout.layers) return;
+    if (!layout || !layout.layers) return out;
     for (var i = 0; i < layout.layers.length; i++) {
       var layer = layout.layers[i];
       if (layer.name !== "hud") continue;
       for (var j = 0; j < layer.instances.length; j++) {
         var inst = layer.instances[j];
-        if (inst && typeof inst.text === "string") fn(inst);
+        if (inst && typeof inst.text === "string") out.push(inst);
       }
     }
+    return out;
   }
 
-  // Swallow game functions while a mod is on, and track run-ending calls.
   function installTriggerHook() {
     var original = rt.trigger;
     rt.trigger = function (method, inst, value) {
       if (method === FN_MATCH && typeof value === "string") {
         var name = value.toLowerCase();
-        if (name === "end_game") extraEggs = 0;
-        if (state.invincible && !allowEnd && (
+        if (state.invincible && (
             name === "collided with track" ||
             name === "end_game" ||
             name === "egg_broken" ||
-            name === "spawn_eggbroke_particles")) {
+            name === "spawn_eggbroke_particles" ||
+            name === "spawn_egghit_particles")) {
           return false;
         }
         if ((state.infMagnet || state.infFreeze) && name === "on_powerbar_finished") return false;
@@ -94,13 +88,11 @@
     };
   }
 
-  // Starts a power-up at once with infinite duration, using the game's own parameters.
   function startPowerUp(type) {
     setVar(type === "MAGNET" ? "MAGNET_TIME" : "FREEZE_TIME", INF_TIME);
     callGameFunction("Activate_aPowerBar", [type, INF_TIME]);
   }
 
-  // Ends a power-up at once, restoring its duration.
   function stopPowerUp(type) {
     setVar(type === "MAGNET" ? "MAGNET_TIME" : "FREEZE_TIME", originals[type]);
     callGameFunction("On_PowerBar_Finished", [type]);
@@ -111,7 +103,7 @@
     var oldStr = String(getVar("myCoins"));
     setVar("myCoins", n);
     callGameFunction("Update_Coins");
-    forEachHudText(function (inst) {
+    hudTexts().forEach(function (inst) {
       if (inst.text === oldStr) { inst.text = String(n); inst.text_changed = true; }
     });
     return true;
@@ -119,12 +111,23 @@
 
   function setScore(n) {
     if (!ready) return false;
-    var perPixel = getVar("SCORE_PER_PIXEL");
     setVar("myScore", n);
-    if (perPixel) setVar("acuDistance", n / perPixel);
-    forEachHudText(function (inst) {
-      if (/^\d+\s*m$/.test(inst.text)) { inst.text = n + "m"; inst.text_changed = true; }
-    });
+    var live = findLiveMeter();
+    if (live) {
+      var raw = parseFloat(live.text) || 0;
+      liveOffset = n - raw;
+      writeLive(live, raw);
+    } else {
+      pendingLive = n;
+    }
+    return true;
+  }
+
+  function setBest(n) {
+    if (!ready) return false;
+    bestValue = n;
+    var perPixel = getVar("SCORE_PER_PIXEL");
+    if (perPixel) setVar("myBestDistance", n / perPixel);
     return true;
   }
 
@@ -133,20 +136,63 @@
     applySpeed();
   }
 
-  // Runs every frame so the game can't reset the values.
   function applySpeed() {
     if (!ready || speedFactor === 1) return;
     if (originals.MAX_VIR_SPEED !== undefined) setVar("MAX_VIR_SPEED", originals.MAX_VIR_SPEED * speedFactor);
     if (originals.COM_BALANCE_FORCE !== undefined) setVar("COM_BALANCE_FORCE", originals.COM_BALANCE_FORCE * speedFactor);
   }
 
-  function endRun() {
-    if (!ready) return false;
-    allowEnd = true;
-    var ok = callGameFunction("End_Game");
-    allowEnd = false;
-    return ok;
+
+  var METER = /^\s*-?\d+(\.\d+)?\s*m\s*$/;
+
+  function findMeters() {
+    var list = hudTexts().filter(function (inst) { return METER.test(inst.text); });
+    if (list.length === 0) return { live: null, best: null };
+    if (list.length === 1) return { live: list[0], best: null };
+    list.sort(function (a, b) { return b.x - a.x; });
+    return { live: list[list.length - 1], best: list[0] };
   }
+
+  function findLiveMeter() {
+    return findMeters().live;
+  }
+
+  function writeLive(inst, raw) {
+    var shown = Math.floor(raw + liveOffset);
+    if (shown < 0) shown = 0;
+    var str = shown + "m";
+    inst.text = str;
+    inst.text_changed = true;
+    lastLiveWritten = str;
+  }
+
+  function updateMeters() {
+    if (!ready) return;
+    var m = findMeters();
+
+    if (m.live) {
+      if (m.live.text !== lastLiveWritten) {
+        var raw = parseFloat(m.live.text) || 0;
+        if (pendingLive !== null) {
+          liveOffset = pendingLive - raw;
+          pendingLive = null;
+        }
+        writeLive(m.live, raw);
+      }
+    }
+
+    if (m.best) {
+      var rawBest = parseFloat(m.best.text) || 0;
+      if (bestValue === null || rawBest > bestValue) bestValue = rawBest;
+      var want = Math.floor(bestValue) + "m";
+      if (m.best.text !== want) {
+        m.best.text = want;
+        m.best.text_changed = true;
+      }
+      lastBestWritten = want;
+    }
+  }
+
 
   function tryInit() {
     var r = window.cr_getC2Runtime && window.cr_getC2Runtime();
@@ -169,7 +215,6 @@
     return true;
   }
 
-  // ---------- ui ----------
 
   var CSS = [
     "#em-panel{position:fixed;top:12px;right:12px;width:230px;z-index:99999;",
@@ -183,18 +228,18 @@
     "color:#fff;font-size:16px;line-height:20px;cursor:pointer;padding:0}",
     "#em-panel .em-body{padding:8px 12px 12px;max-height:75vh;overflow:auto}",
     "#em-panel.em-collapsed .em-body{display:none}",
-    "#em-panel .em-sec{font-size:11px;opacity:.6;margin:10px 0 4px}",
     "#em-panel label{display:flex;align-items:center;gap:8px;padding:3px 0;cursor:pointer}",
     "#em-panel input[type=checkbox]{width:15px;height:15px;accent-color:#fff;margin:0}",
-    "#em-panel .em-row{display:flex;gap:6px;margin-bottom:6px;align-items:center}",
-    "#em-panel input[type=number]{flex:1;min-width:0;padding:5px 7px;border-radius:6px;border:1px solid #fff;",
-    "background:#000;color:#fff;font:inherit;outline:none}",
+    "#em-panel .em-row{display:flex;gap:6px;margin:6px 0;align-items:center}",
+    "#em-panel input[type=number]{flex:1;min-width:0;width:0;padding:5px 7px;border-radius:6px;border:1px solid #fff;",
+    "background:#000;color:#fff;font:inherit;outline:none;-moz-appearance:textfield;appearance:textfield}",
+    "#em-panel input[type=number]::-webkit-inner-spin-button,#em-panel input[type=number]::-webkit-outer-spin-button{",
+    "-webkit-appearance:none;margin:0}",
     "#em-panel input[type=range]{flex:1;accent-color:#fff}",
     "#em-panel .em-val{width:44px;text-align:right;font-size:12px}",
     "#em-panel button.em-btn{padding:5px 9px;border:1px solid #fff;border-radius:6px;background:#000;",
     "color:#fff;font:inherit;cursor:pointer;white-space:nowrap}",
-    "#em-panel button.em-btn:hover{background:#fff;color:#000}",
-    "#em-panel button.em-danger{width:100%;margin-top:4px}"
+    "#em-panel button.em-btn:hover{background:#fff;color:#000}"
   ].join("");
 
   var panel, minBtn;
@@ -220,18 +265,18 @@
     return cb;
   }
 
-  function addButton(parent, label, onClick, extraClass) {
-    var b = el("button", { type: "button", "class": "em-btn" + (extraClass ? " " + extraClass : "") }, label);
+  function addButton(parent, label, onClick) {
+    var b = el("button", { type: "button", "class": "em-btn" }, label);
     b.addEventListener("click", onClick);
     parent.appendChild(b);
     return b;
   }
 
-  function addNumberSetter(parent, name, label, onApply) {
+  function addNumberSetter(parent, name, onApply) {
     var row = el("div", { "class": "em-row" });
     var input = el("input", { type: "number", min: "0", step: "1", placeholder: name });
     row.appendChild(input);
-    addButton(row, label, function () {
+    addButton(row, "set " + name, function () {
       var n = Math.floor(Number(input.value));
       if (input.value === "" || !isFinite(n) || n < 0) return;
       onApply(n);
@@ -253,7 +298,6 @@
     parent.appendChild(row);
   }
 
-  // Keeps typing and clicks in the menu away from the game's input handlers
   function stopInputLeak(node) {
     ["keydown", "keyup", "keypress", "pointerdown", "mousedown", "touchstart", "wheel"].forEach(function (type) {
       node.addEventListener(type, function (e) { e.stopPropagation(); }, false);
@@ -300,7 +344,6 @@
 
     var body = el("div", { "class": "em-body" });
 
-    body.appendChild(el("div", { "class": "em-sec" }, "cheats"));
     var invCb = addToggle(body, "invincible", "invincible egg", function () {});
     var magCb = addToggle(body, "infMagnet", "infinite magnet", function (on) {
       if (on) startPowerUp("MAGNET"); else stopPowerUp("MAGNET");
@@ -309,20 +352,15 @@
       if (on) startPowerUp("FREEZE"); else stopPowerUp("FREEZE");
     });
 
-    body.appendChild(el("div", { "class": "em-sec" }, "eggs"));
     addButton(body, "spawn extra egg", function () {
-      if (callGameFunction("Spawn_aEgg")) extraEggs++;
+      callGameFunction("Spawn_aEgg");
     });
 
-    body.appendChild(el("div", { "class": "em-sec" }, "speed and accel"));
     addSpeedSlider(body);
 
-    body.appendChild(el("div", { "class": "em-sec" }, "set values"));
-    addNumberSetter(body, "coins", "set coins", setCoins);
-    addNumberSetter(body, "score", "set score", setScore);
-
-    body.appendChild(el("div", { "class": "em-sec" }, "run"));
-    addButton(body, "end run", endRun, "em-danger");
+    addNumberSetter(body, "coins", setCoins);
+    addNumberSetter(body, "score", setScore);
+    addNumberSetter(body, "best", setBest);
 
     panel.appendChild(body);
     document.body.appendChild(panel);
@@ -335,8 +373,11 @@
 
     makeDraggable(panel, head);
 
-    // keep speed applied every frame
-    (function frame() { applySpeed(); requestAnimationFrame(frame); })();
+    (function frame() {
+      updateMeters();
+      applySpeed();
+      requestAnimationFrame(frame);
+    })();
 
     setInterval(function () {
       if (!ready && tryInit()) {
@@ -350,12 +391,10 @@
     }, 500);
   }
 
-  // A new run rebuilds the power bar and resets the extra egg count.
   function checkNewRun() {
     var seq = getVar("gameSequence");
     var gp = getVar("SEQ_GP");
     if (seq === gp && lastSeq !== gp) {
-      extraEggs = 0;
       clearTimeout(enterTimer);
       enterTimer = setTimeout(function () {
         if (state.infFreeze) startPowerUp("FREEZE");
@@ -365,14 +404,13 @@
     lastSeq = seq;
   }
 
-  // ---------- start ----------
 
   window.EggyMods = {
     state: state,
     setCoins: setCoins,
     setScore: setScore,
+    setBest: setBest,
     setSpeed: setSpeed,
-    endRun: endRun,
     spawnEgg: function () { return callGameFunction("Spawn_aEgg"); }
   };
 
