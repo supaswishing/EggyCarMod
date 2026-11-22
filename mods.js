@@ -1,3 +1,12 @@
+/*
+ * mod menu for eggy car
+ * loaded after c2runtime.js. uses:
+ *  - global variables: myCoins, myScore, acuDistance, SCORE_PER_PIXEL, MAGNET_TIME, FREEZE_TIME,
+ *    MAX_VIR_SPEED, COM_BALANCE_FORCE, gameSequence, SEQ_GP
+ *  - the function plugin, to run the game's own functions by name
+ *  - a wrapper around rt.trigger, to stop specific game functions from firing
+ *  - the hud layer's text objects, so displayed numbers update right away
+ */
 (function () {
   "use strict";
   if (window.EggyMods) return;
@@ -5,16 +14,18 @@
   var INF_TIME = 1000000;
   var rt = null;
   var ready = false;
-  var FN_MATCH = null;
-  var FN_CALL = null;
-  var caller = null;
+  var FN_MATCH = null;   // function plugin OnFunction condition
+  var FN_CALL = null;    // function plugin CallFunction action
+  var caller = null;     // fake "this" for FN_CALL: needs runtime and a system type
   var originals = {};
   var lastSeq = null;
   var enterTimer = null;
+  var allowEnd = false;  // lets the end run button through while invincible is on
   var extraEggs = 0;
   var speedFactor = 1;
   var state = { invincible: false, infMagnet: false, infFreeze: false };
 
+  // ---------- runtime helpers ----------
 
   function findGlobal(name) {
     var list = rt && rt.all_global_vars;
@@ -37,6 +48,7 @@
     return true;
   }
 
+  // Runs a game function by name. Errors go to the console only.
   function callGameFunction(name, params) {
     if (!ready) return false;
     try {
@@ -48,24 +60,47 @@
     }
   }
 
+  // Finds text objects on the hud layer and runs fn on each one.
+  function forEachHudText(fn) {
+    var layout = rt && rt.running_layout;
+    if (!layout || !layout.layers) return;
+    for (var i = 0; i < layout.layers.length; i++) {
+      var layer = layout.layers[i];
+      if (layer.name !== "hud") continue;
+      for (var j = 0; j < layer.instances.length; j++) {
+        var inst = layer.instances[j];
+        if (inst && typeof inst.text === "string") fn(inst);
+      }
+    }
+  }
+
+  // Swallow game functions while a mod is on, and track run-ending calls.
   function installTriggerHook() {
     var original = rt.trigger;
     rt.trigger = function (method, inst, value) {
       if (method === FN_MATCH && typeof value === "string") {
         var name = value.toLowerCase();
         if (name === "end_game") extraEggs = 0;
-        if (state.invincible && (name === "collided with track" || name === "end_game")) return false;
+        if (state.invincible && !allowEnd && (
+            name === "collided with track" ||
+            name === "end_game" ||
+            name === "egg_broken" ||
+            name === "spawn_eggbroke_particles")) {
+          return false;
+        }
         if ((state.infMagnet || state.infFreeze) && name === "on_powerbar_finished") return false;
       }
       return original.apply(this, arguments);
     };
   }
 
+  // Starts a power-up at once with infinite duration, using the game's own parameters.
   function startPowerUp(type) {
     setVar(type === "MAGNET" ? "MAGNET_TIME" : "FREEZE_TIME", INF_TIME);
     callGameFunction("Activate_aPowerBar", [type, INF_TIME]);
   }
 
+  // Ends a power-up at once, restoring its duration.
   function stopPowerUp(type) {
     setVar(type === "MAGNET" ? "MAGNET_TIME" : "FREEZE_TIME", originals[type]);
     callGameFunction("On_PowerBar_Finished", [type]);
@@ -73,23 +108,44 @@
 
   function setCoins(n) {
     if (!ready) return false;
+    var oldStr = String(getVar("myCoins"));
     setVar("myCoins", n);
     callGameFunction("Update_Coins");
+    forEachHudText(function (inst) {
+      if (inst.text === oldStr) { inst.text = String(n); inst.text_changed = true; }
+    });
     return true;
   }
 
   function setScore(n) {
     if (!ready) return false;
+    var perPixel = getVar("SCORE_PER_PIXEL");
     setVar("myScore", n);
-    callGameFunction("Update_Score");
+    if (perPixel) setVar("acuDistance", n / perPixel);
+    forEachHudText(function (inst) {
+      if (/^\d+\s*m$/.test(inst.text)) { inst.text = n + "m"; inst.text_changed = true; }
+    });
     return true;
   }
 
   function setSpeed(factor) {
     speedFactor = factor;
-    if (ready && originals.MAX_VIR_SPEED !== undefined) {
-      setVar("MAX_VIR_SPEED", originals.MAX_VIR_SPEED * factor);
-    }
+    applySpeed();
+  }
+
+  // Runs every frame so the game can't reset the values.
+  function applySpeed() {
+    if (!ready || speedFactor === 1) return;
+    if (originals.MAX_VIR_SPEED !== undefined) setVar("MAX_VIR_SPEED", originals.MAX_VIR_SPEED * speedFactor);
+    if (originals.COM_BALANCE_FORCE !== undefined) setVar("COM_BALANCE_FORCE", originals.COM_BALANCE_FORCE * speedFactor);
+  }
+
+  function endRun() {
+    if (!ready) return false;
+    allowEnd = true;
+    var ok = callGameFunction("End_Game");
+    allowEnd = false;
+    return ok;
   }
 
   function tryInit() {
@@ -106,40 +162,42 @@
     originals.MAGNET = getVar("MAGNET_TIME");
     originals.FREEZE = getVar("FREEZE_TIME");
     originals.MAX_VIR_SPEED = getVar("MAX_VIR_SPEED");
+    originals.COM_BALANCE_FORCE = getVar("COM_BALANCE_FORCE");
     lastSeq = getVar("gameSequence");
     installTriggerHook();
     ready = true;
     return true;
   }
 
+  // ---------- ui ----------
 
   var CSS = [
     "#em-panel{position:fixed;top:12px;right:12px;width:230px;z-index:99999;",
     "font:13px/1.35 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#fff;",
-    "background:#1c2430;border:1px solid #3a4658;border-radius:10px;",
+    "background:#000;border:1px solid #fff;border-radius:8px;",
     "user-select:none;-webkit-user-select:none;text-transform:lowercase}",
     "#em-panel *{text-transform:lowercase;box-shadow:none;text-shadow:none}",
     "#em-panel .em-head{display:flex;align-items:center;justify-content:space-between;padding:8px 8px 8px 12px;",
-    "cursor:move;border-bottom:1px solid #3a4658;font-weight:700}",
-    "#em-panel .em-min{width:24px;height:24px;border:0;border-radius:6px;background:#2d3848;",
-    "color:#fff;font-size:16px;line-height:22px;cursor:pointer;padding:0}",
+    "cursor:move;border-bottom:1px solid #fff;font-weight:700}",
+    "#em-panel .em-min{width:24px;height:24px;border:1px solid #fff;border-radius:6px;background:#000;",
+    "color:#fff;font-size:16px;line-height:20px;cursor:pointer;padding:0}",
     "#em-panel .em-body{padding:8px 12px 12px;max-height:75vh;overflow:auto}",
     "#em-panel.em-collapsed .em-body{display:none}",
-    "#em-panel .em-status{font-size:11px;opacity:.7;margin-bottom:6px}",
     "#em-panel .em-sec{font-size:11px;opacity:.6;margin:10px 0 4px}",
     "#em-panel label{display:flex;align-items:center;gap:8px;padding:3px 0;cursor:pointer}",
-    "#em-panel input[type=checkbox]{width:15px;height:15px;accent-color:#5a9fd4;margin:0}",
+    "#em-panel input[type=checkbox]{width:15px;height:15px;accent-color:#fff;margin:0}",
     "#em-panel .em-row{display:flex;gap:6px;margin-bottom:6px;align-items:center}",
-    "#em-panel input[type=number]{flex:1;min-width:0;padding:5px 7px;border-radius:6px;border:1px solid #3a4658;",
-    "background:#131a24;color:#fff;font:inherit;outline:none}",
-    "#em-panel input[type=range]{flex:1;accent-color:#5a9fd4}",
+    "#em-panel input[type=number]{flex:1;min-width:0;padding:5px 7px;border-radius:6px;border:1px solid #fff;",
+    "background:#000;color:#fff;font:inherit;outline:none}",
+    "#em-panel input[type=range]{flex:1;accent-color:#fff}",
     "#em-panel .em-val{width:44px;text-align:right;font-size:12px}",
-    "#em-panel button.em-btn{padding:5px 9px;border:0;border-radius:6px;background:#2d3848;",
+    "#em-panel button.em-btn{padding:5px 9px;border:1px solid #fff;border-radius:6px;background:#000;",
     "color:#fff;font:inherit;cursor:pointer;white-space:nowrap}",
-    "#em-panel button.em-btn:hover{background:#384559}"
+    "#em-panel button.em-btn:hover{background:#fff;color:#000}",
+    "#em-panel button.em-danger{width:100%;margin-top:4px}"
   ].join("");
 
-  var panel, statusEl, minBtn, flashTimer = null;
+  var panel, minBtn;
 
   function el(tag, attrs, text) {
     var n = document.createElement(tag);
@@ -148,25 +206,11 @@
     return n;
   }
 
-  function flash(msg) {
-    statusEl.textContent = msg;
-    clearTimeout(flashTimer);
-    flashTimer = setTimeout(refreshStatus, 1800);
-  }
-
-  function refreshStatus() {
-    statusEl.textContent = ready ? "connected to game" : "waiting for game to load...";
-  }
-
   function addToggle(parent, key, label, onChange) {
     var lab = el("label");
     var cb = el("input", { type: "checkbox" });
     cb.addEventListener("change", function () {
-      if (!ready) {
-        cb.checked = false;
-        flash("game not ready yet");
-        return;
-      }
+      if (!ready) { cb.checked = false; return; }
       state[key] = cb.checked;
       onChange(cb.checked);
     });
@@ -176,23 +220,21 @@
     return cb;
   }
 
-  function addButton(parent, label, onClick) {
-    var b = el("button", { type: "button", "class": "em-btn" }, label);
+  function addButton(parent, label, onClick, extraClass) {
+    var b = el("button", { type: "button", "class": "em-btn" + (extraClass ? " " + extraClass : "") }, label);
     b.addEventListener("click", onClick);
     parent.appendChild(b);
     return b;
   }
 
-  function addNumberSetter(parent, name, onApply) {
+  function addNumberSetter(parent, name, label, onApply) {
     var row = el("div", { "class": "em-row" });
     var input = el("input", { type: "number", min: "0", step: "1", placeholder: name });
     row.appendChild(input);
-    addButton(row, "set " + name, function () {
+    addButton(row, label, function () {
       var n = Math.floor(Number(input.value));
-      if (input.value === "" || !isFinite(n) || n < 0) { flash("enter a whole number"); return; }
-      if (!ready) { flash("game not ready yet"); return; }
-      if (onApply(n)) flash(name + " set to " + n);
-      else flash("failed, see console");
+      if (input.value === "" || !isFinite(n) || n < 0) return;
+      onApply(n);
     });
     parent.appendChild(row);
   }
@@ -204,15 +246,14 @@
     input.addEventListener("input", function () {
       var pct = Number(input.value);
       val.textContent = pct + "%";
-      if (!ready) { flash("game not ready yet"); return; }
       setSpeed(pct / 100);
     });
     row.appendChild(input);
     row.appendChild(val);
     parent.appendChild(row);
-    return input;
   }
 
+  // Keeps typing and clicks in the menu away from the game's input handlers
   function stopInputLeak(node) {
     ["keydown", "keyup", "keypress", "pointerdown", "mousedown", "touchstart", "wheel"].forEach(function (type) {
       node.addEventListener(type, function (e) { e.stopPropagation(); }, false);
@@ -258,8 +299,6 @@
     panel.appendChild(head);
 
     var body = el("div", { "class": "em-body" });
-    statusEl = el("div", { "class": "em-status" });
-    body.appendChild(statusEl);
 
     body.appendChild(el("div", { "class": "em-sec" }, "cheats"));
     var invCb = addToggle(body, "invincible", "invincible egg", function () {});
@@ -272,17 +311,18 @@
 
     body.appendChild(el("div", { "class": "em-sec" }, "eggs"));
     addButton(body, "spawn extra egg", function () {
-      if (!ready) { flash("game not ready yet"); return; }
-      if (callGameFunction("Spawn_aEgg")) { extraEggs++; flash("extra eggs this run: " + extraEggs); }
-      else flash("failed, see console");
+      if (callGameFunction("Spawn_aEgg")) extraEggs++;
     });
 
-    body.appendChild(el("div", { "class": "em-sec" }, "car speed"));
+    body.appendChild(el("div", { "class": "em-sec" }, "speed and accel"));
     addSpeedSlider(body);
 
     body.appendChild(el("div", { "class": "em-sec" }, "set values"));
-    addNumberSetter(body, "coins", setCoins);
-    addNumberSetter(body, "score", setScore);
+    addNumberSetter(body, "coins", "set coins", setCoins);
+    addNumberSetter(body, "score", "set score", setScore);
+
+    body.appendChild(el("div", { "class": "em-sec" }, "run"));
+    addButton(body, "end run", endRun, "em-danger");
 
     panel.appendChild(body);
     document.body.appendChild(panel);
@@ -294,15 +334,15 @@
     });
 
     makeDraggable(panel, head);
-    refreshStatus();
+
+    // keep speed applied every frame
+    (function frame() { applySpeed(); requestAnimationFrame(frame); })();
 
     setInterval(function () {
       if (!ready && tryInit()) {
         if (state.infMagnet) startPowerUp("MAGNET");
         if (state.infFreeze) startPowerUp("FREEZE");
-        if (speedFactor !== 1) setSpeed(speedFactor);
       }
-      refreshStatus();
       invCb.checked = state.invincible;
       magCb.checked = state.infMagnet;
       frzCb.checked = state.infFreeze;
@@ -310,6 +350,7 @@
     }, 500);
   }
 
+  // A new run rebuilds the power bar and resets the extra egg count.
   function checkNewRun() {
     var seq = getVar("gameSequence");
     var gp = getVar("SEQ_GP");
@@ -324,12 +365,14 @@
     lastSeq = seq;
   }
 
+  // ---------- start ----------
 
   window.EggyMods = {
     state: state,
     setCoins: setCoins,
     setScore: setScore,
     setSpeed: setSpeed,
+    endRun: endRun,
     spawnEgg: function () { return callGameFunction("Spawn_aEgg"); }
   };
 
